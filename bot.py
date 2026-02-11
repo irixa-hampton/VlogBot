@@ -1,11 +1,20 @@
+import os
 import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 import aiosqlite
-import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from keep_alive import keep_alive
+
+keep_alive()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN not set")
+
+bot.run(TOKEN)
 
 # ---------- SETUP ----------
 load_dotenv()
@@ -363,3 +372,4 @@ async def on_guild_join(guild):
     await tree.sync(guild=guild)
 
 bot.run(TOKEN)
+
