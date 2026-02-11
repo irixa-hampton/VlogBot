@@ -1,16 +1,17 @@
+import asyncio
+import os
 import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 import aiosqlite
-import os
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from keep_alive import keep_alive
+from keep_alive import keep_alive  # Import your keep_alive function
 
 # ---------- SETUP ----------
 load_dotenv()
-keep_alive()  # For Render Web Service
+keep_alive()  # Start the Flask server for uptime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -37,6 +38,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS reminders (
             user_id INTEGER,
             reminder_time TEXT,
+            last_sent TEXT,
             PRIMARY KEY (user_id, reminder_time)
         );
 
@@ -53,6 +55,13 @@ async def init_db():
             timezone TEXT DEFAULT 'UTC'
         );
         """)
+
+        # Handle migration: avoid duplicate column errors
+        try:
+            await db.execute("ALTER TABLE reminders ADD COLUMN last_sent TEXT")
+        except aiosqlite.OperationalError:
+            pass
+
         await db.commit()
 
 # ---------- HELPERS ----------
@@ -73,19 +82,21 @@ async def get_guild_config(gid: int):
         return await cur.fetchone()
 
 # ---------- WEEKLY CHECK ----------
-@tasks.loop(minutes=1)
+@tasks.loop(time=dtime(hour=23, minute=59, second=0))
 async def weekly_check():
     for guild in bot.guilds:
         config = await get_guild_config(guild.id)
-        tz_name = config[2] if config else "UTC"
+        tz_name = config[2] if config and config[2] else "UTC"
         tz = ZoneInfo(tz_name)
         now = datetime.now(tz)
 
+        # For testing, trigger at specific times, otherwise schedule weekly
         if now.weekday() != 5 or now.hour != 23 or now.minute != 59:
             continue
 
         today = now.date().isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
+            # Check last checked to prevent duplicate checks
             cur = await db.execute(
                 "SELECT last_checked FROM group_streak WHERE guild_id=?",
                 (guild.id,)
@@ -103,12 +114,13 @@ async def weekly_check():
                     "SELECT recorded_this_week FROM users WHERE user_id=?",
                     (m.id,)
                 )
-                if (await cur.fetchone())[0] == 0:
+                rec = await cur.fetchone()
+                if not rec or rec[0] == 0:
                     missed.append(m.id)
 
             if not missed:
                 await db.execute(
-                    "INSERT INTO group_streak (guild_id, streak, last_checked) VALUES (?,1,?) "
+                    "INSERT INTO group_streak (guild_id, streak, last_checked) VALUES (?, 1, ?) "
                     "ON CONFLICT(guild_id) DO UPDATE SET streak=streak+1, last_checked=?",
                     (guild.id, today, today)
                 )
@@ -130,28 +142,57 @@ async def weekly_check():
 # ---------- REMINDERS ----------
 @tasks.loop(minutes=1)
 async def reminder_loop():
+    await bot.wait_until_ready()
+    print("[REMINDER LOOP TICK]")  # Debug
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
-            SELECT r.user_id, r.reminder_time, u.timezone, u.recorded_this_week
+            SELECT r.user_id, r.reminder_time, r.last_sent, u.timezone, u.recorded_this_week
             FROM reminders r
             JOIN users u ON r.user_id = u.user_id
         """)
         reminders = await cur.fetchall()
 
-    for uid, r_time, tz_name, recorded in reminders:
+    for uid, r_time, last_sent, tz_name, recorded in reminders:
         if recorded:
             continue
 
         try:
             now = datetime.now(ZoneInfo(tz_name))
-        except Exception:
+        except:
             now = datetime.utcnow()
 
-        if now.strftime("%H:%M") != r_time:
+        # Parse reminder time
+        try:
+            target_time = dtime.fromisoformat(r_time)
+        except:
+            continue
+
+        # Check if it's time to send
+        if not (now.hour == target_time.hour and abs(now.minute - target_time.minute) <= 1):
+            continue
+
+        today_str = now.date().isoformat()
+
+        if last_sent == today_str:
             continue
 
         try:
             user = await bot.fetch_user(uid)
+            # Send DM
+            try:
+                await user.send("⏰ Reminder: Don't forget to record this week!")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE reminders SET last_sent=? WHERE user_id=? AND reminder_time=?",
+                        (today_str, uid, r_time)
+                    )
+                    await db.commit()
+                continue
+            except discord.Forbidden:
+                pass  # fallback to channel
+
+            # Send in server channel
             for guild in bot.guilds:
                 member = guild.get_member(uid)
                 if not member:
@@ -159,21 +200,23 @@ async def reminder_loop():
                 config = await get_guild_config(guild.id)
                 if not config:
                     continue
-                vlogger_role_id, reminder_channel_id, _ = config
-                if not vlogger_role_id:
-                    continue
-                if not discord.utils.get(member.roles, id=vlogger_role_id):
-                    continue
-                try:
-                    await user.send("⏰ Reminder: Don't forget to record this week!")
-                except discord.Forbidden:
-                    if reminder_channel_id:
-                        channel = guild.get_channel(reminder_channel_id)
-                        if channel:
-                            await channel.send(f"⏰ {member.mention} reminder: don’t forget to record this week!")
-                break
-        except Exception:
-            continue
+                _, reminder_channel_id, _ = config
+                if reminder_channel_id:
+                    channel = guild.get_channel(reminder_channel_id)
+                    if channel:
+                        await channel.send(
+                            f"⏰ {member.mention} reminder: don’t forget to record this week!"
+                        )
+                        # Update last_sent
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE reminders SET last_sent=? WHERE user_id=? AND reminder_time=?",
+                                (today_str, uid, r_time)
+                            )
+                            await db.commit()
+                        break
+        except Exception as e:
+            print(f"[REMINDER ERROR] User {uid}: {e}")
 
 # ---------- SLASH COMMAND HELPERS ----------
 async def send_response(interaction, message, ephemeral=True):
@@ -244,7 +287,7 @@ async def setreminderchannel(interaction: discord.Interaction, channel: discord.
 async def setservertimezone(interaction: discord.Interaction, timezone: str):
     try:
         ZoneInfo(timezone)
-    except Exception:
+    except:
         await send_response(interaction, "❌ Invalid timezone")
         return
     async with aiosqlite.connect(DB_PATH) as db:
@@ -261,7 +304,7 @@ async def setservertimezone(interaction: discord.Interaction, timezone: str):
 async def settimezone(interaction: discord.Interaction, timezone: str):
     try:
         ZoneInfo(timezone)
-    except Exception:
+    except:
         await send_response(interaction, "❌ Invalid timezone. Example: America/Chicago")
         return
     await ensure_user(interaction.user.id)
@@ -270,75 +313,47 @@ async def settimezone(interaction: discord.Interaction, timezone: str):
         await db.commit()
     await send_response(interaction, f"✅ Your timezone is set to {timezone}")
 
-# ---------- REMINDER COMMANDS ----------
-from datetime import time as dtime
-
-@tasks.loop(minutes=1)
-async def reminder_loop():
+# ---------- REMINDER MANAGEMENT ----------
+@tree.command(name="addreminder", description="Set a personal reminder at HH:MM in your timezone")
+async def addreminder(interaction: discord.Interaction, time_str: str):
+    try:
+        # Validate time
+        target_time = dtime.fromisoformat(time_str)
+    except:
+        await send_response(interaction, "❌ Invalid time format. Use HH:MM.")
+        return
+    await ensure_user(interaction.user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT r.user_id, r.reminder_time, u.timezone, u.recorded_this_week
-            FROM reminders r
-            JOIN users u ON r.user_id = u.user_id
-        """)
-        reminders = await cur.fetchall()
-
-    for uid, r_time, tz_name, recorded in reminders:
-        if recorded:
-            continue
-
-        try:
-            now = datetime.now(ZoneInfo(tz_name))
-        except Exception:
-            now = datetime.utcnow()
-
-        try:
-            target = dtime.fromisoformat(r_time)
-        except ValueError:
-            continue
-
-        delta = abs(
-            (now - now.replace(
-                hour=target.hour,
-                minute=target.minute,
-                second=0
-            )).total_seconds()
+        await db.execute(
+            "INSERT OR REPLACE INTO reminders (user_id, reminder_time, last_sent) VALUES (?, ?, ?)",
+            (interaction.user.id, time_str, None)
         )
+        await db.commit()
+    await send_response(interaction, f"✅ Reminder set at {time_str}.")
 
-        if delta > 60:
-            continue
+@tree.command(name="removereminder", description="Remove a specific reminder time")
+async def removereminder(interaction: discord.Interaction, time_str: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM reminders WHERE user_id=? AND reminder_time=?",
+            (interaction.user.id, time_str)
+        )
+        await db.commit()
+    await send_response(interaction, f"✅ Reminder at {time_str} removed.")
 
-        try:
-            user = await bot.fetch_user(uid)
-
-            # ---- DM FIRST ----
-            try:
-                await user.send("⏰ Reminder: Don't forget to record this week!")
-                continue
-            except discord.Forbidden:
-                pass
-
-            # ---- FALLBACK TO SERVER CHANNEL ----
-            for guild in bot.guilds:
-                member = guild.get_member(uid)
-                if not member:
-                    continue
-
-                config = await get_guild_config(guild.id)
-                if not config:
-                    continue
-
-                _, reminder_channel_id, _ = config
-                if reminder_channel_id:
-                    channel = guild.get_channel(reminder_channel_id)
-                    if channel:
-                        await channel.send(
-                            f"⏰ {member.mention} reminder: don’t forget to record this week!"
-                        )
-                        break
-
-        except Exception as e:
-            print(f"[REMINDER ERROR] User {uid}: {e}")
+@tree.command(name="listreminders", description="List all your active reminders")
+async def listreminders(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT reminder_time FROM reminders WHERE user_id=?",
+            (interaction.user.id,)
+        )
+        rows = await cur.fetchall()
+    reminders = [row[0] for row in rows]
+    if reminders:
+        await send_response(interaction, "Your reminders:\n" + "\n".join(reminders))
+    else:
+        await send_response(interaction, "You have no active reminders.")
 
 # ---------- HELP ----------
 @tree.command(name="help", description="Show all commands")
@@ -352,28 +367,28 @@ async def help_command(interaction: discord.Interaction):
 
 **/groupstreak** - Check the group weekly streak.
 
-**/setreminder HH:MM** - Set a personal reminder DM at the time you specify.
+**/settimezone Your/Timezone** - Set your personal timezone.
 
-**/removereminder HH:MM** - Remove a reminder you previously set.
+**/addreminder HH:MM** - Set a reminder at specific time.
 
-**/listreminders** - Show all reminders you currently have set.
+**/removereminder HH:MM** - Remove a reminder.
 
-**/setvloggerrole @Role** - (Admin) Set which role is considered Vloggers.
+**/listreminders** - List all your reminders.
 
-**/setreminderchannel #Channel** - (Admin) Set the server channel used if DMs are closed.
+**/setvloggerrole @Role** - (Admin) Set Vlogger role.
 
-**/setservertimezone Your/Timezone** - (Admin) Set the server timezone for streak checks.
+**/setreminderchannel #Channel** - (Admin) Set fallback reminder channel.
 
-**/settimezone Your/Timezone** - (Optional) Set your personal timezone.
+**/setservertimezone Your/Timezone** - (Admin) Set server timezone.
 """
     await send_response(interaction, help_text)
 
-# ---------- ERROR HANDLER ----------
+# ---------- ERROR HANDLING ----------
 @tree.error
-async def on_app_command_error(interaction: discord.Interaction, error):
-    print(f"Error in command {interaction.command.name}: {error}")
+async def on_app_command_error(interaction, error):
+    print(f"Error in {interaction.command}: {error}")
     try:
-        await interaction.response.send_message("❌ Something went wrong.", ephemeral=True)
+        await interaction.response.send_message("❌ An error occurred.", ephemeral=True)
     except:
         pass
 
@@ -382,13 +397,22 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 async def on_ready():
     print(f"Logged in as {bot.user}")
     await init_db()
-    await tree.sync()
-    weekly_check.start()
-    reminder_loop.start()
+    try:
+        await tree.sync()
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+    # Start background tasks
+    if not weekly_check.is_running():
+        weekly_check.start()
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+    print("Tasks started.")
 
-@bot.event
-async def on_guild_join(guild):
-    await tree.sync(guild=guild)
+# Call keep_alive() before starting the bot
+keep_alive()
 
-bot.run(TOKEN)
+# Run the bot
+async def main():
+    await bot.start(TOKEN)
 
+asyncio.run(main())
