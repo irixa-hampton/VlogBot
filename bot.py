@@ -271,43 +271,74 @@ async def settimezone(interaction: discord.Interaction, timezone: str):
     await send_response(interaction, f"✅ Your timezone is set to {timezone}")
 
 # ---------- REMINDER COMMANDS ----------
-@tree.command(name="setreminder", description="Set a personal reminder (24-hour format HH:MM)")
-async def setreminder(interaction: discord.Interaction, time: str):
-    try:
-        datetime.strptime(time, "%H:%M")
-    except ValueError:
-        await send_response(interaction, "⏰ Time must be HH:MM in 24-hour format")
-        return
-    await ensure_user(interaction.user.id)
+from datetime import time as dtime
+
+@tasks.loop(minutes=1)
+async def reminder_loop():
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM reminders WHERE user_id=?", (interaction.user.id,))
-        count = (await cur.fetchone())[0]
-        if count >= 5:
-            await send_response(interaction, "You already have 5 reminders set")
-            return
-        await db.execute(
-            "INSERT OR IGNORE INTO reminders (user_id, reminder_time) VALUES (?,?)",
-            (interaction.user.id, time)
+        cur = await db.execute("""
+            SELECT r.user_id, r.reminder_time, u.timezone, u.recorded_this_week
+            FROM reminders r
+            JOIN users u ON r.user_id = u.user_id
+        """)
+        reminders = await cur.fetchall()
+
+    for uid, r_time, tz_name, recorded in reminders:
+        if recorded:
+            continue
+
+        try:
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now = datetime.utcnow()
+
+        try:
+            target = dtime.fromisoformat(r_time)
+        except ValueError:
+            continue
+
+        delta = abs(
+            (now - now.replace(
+                hour=target.hour,
+                minute=target.minute,
+                second=0
+            )).total_seconds()
         )
-        await db.commit()
-    await send_response(interaction, f"✅ Reminder set for {time} daily")
 
-@tree.command(name="removereminder", description="Remove a personal reminder")
-async def removereminder(interaction: discord.Interaction, time: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM reminders WHERE user_id=? AND reminder_time=?", (interaction.user.id, time))
-        await db.commit()
-    await send_response(interaction, f"✅ Reminder {time} removed")
+        if delta > 60:
+            continue
 
-@tree.command(name="listreminders", description="List all your personal reminders")
-async def listreminders(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT reminder_time FROM reminders WHERE user_id=?", (interaction.user.id,))
-        rows = await cur.fetchall()
-    if rows:
-        await send_response(interaction, "⏰ Your reminders: " + ", ".join(r[0] for r in rows))
-    else:
-        await send_response(interaction, "You have no reminders set")
+        try:
+            user = await bot.fetch_user(uid)
+
+            # ---- DM FIRST ----
+            try:
+                await user.send("⏰ Reminder: Don't forget to record this week!")
+                continue
+            except discord.Forbidden:
+                pass
+
+            # ---- FALLBACK TO SERVER CHANNEL ----
+            for guild in bot.guilds:
+                member = guild.get_member(uid)
+                if not member:
+                    continue
+
+                config = await get_guild_config(guild.id)
+                if not config:
+                    continue
+
+                _, reminder_channel_id, _ = config
+                if reminder_channel_id:
+                    channel = guild.get_channel(reminder_channel_id)
+                    if channel:
+                        await channel.send(
+                            f"⏰ {member.mention} reminder: don’t forget to record this week!"
+                        )
+                        break
+
+        except Exception as e:
+            print(f"[REMINDER ERROR] User {uid}: {e}")
 
 # ---------- HELP ----------
 @tree.command(name="help", description="Show all commands")
@@ -360,3 +391,4 @@ async def on_guild_join(guild):
     await tree.sync(guild=guild)
 
 bot.run(TOKEN)
+
